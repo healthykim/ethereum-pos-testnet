@@ -1,78 +1,86 @@
 #!/bin/bash
 
-set -exu
+set -eu
 set -o pipefail
 
-# Check if jq is installed
-if ! command -v jq &> /dev/null; then
-    echo "Error: jq is not installed. Please install jq first."
+# Check dependencies
+for cmd in jq curl; do
+    if ! command -v $cmd &> /dev/null; then
+        echo "Error: $cmd is not installed. Please install $cmd first."
+        exit 1
+    fi
+done
+
+
+if [ -z "$1" ]; then
+    echo "Usage: $0 <number_of_nodes>"
     exit 1
 fi
-# Check if curl is installed
-if ! command -v curl &> /dev/null; then
-    echo "Error: curl is not installed. Please install curl first."
-    exit 1
+
+NUM_NODES=$1
+NUM_LOGS=$NUM_NODES
+
+if [ $NUM_NODES -gt 2 ]; then
+    if [ -z "$2" ]; then
+        echo "Usage: $0 <number_of_nodes> <number_of_logs>"
+        exit 1
+    fi
+    NUM_LOGS=$2
 fi
 
-# NETWORK_DIR is where all files for the testnet will be stored,
-# including logs and storage
-NETWORK_DIR=./network
-
-# Change this number for your desired number of nodes
-NUM_NODES=2
-
-# Port information. All ports will be incremented upon
-# with more validators to prevent port conflicts on a single machine
-GETH_BOOTNODE_PORT=30301
-
-GETH_HTTP_PORT=8000
-GETH_WS_PORT=8100
-GETH_AUTH_RPC_PORT=8200
-GETH_METRICS_PORT=8300
-GETH_NETWORK_PORT=8400
-
-PRYSM_BEACON_RPC_PORT=4000
-PRYSM_BEACON_GRPC_GATEWAY_PORT=4100
-PRYSM_BEACON_P2P_TCP_PORT=4200
-PRYSM_BEACON_P2P_UDP_PORT=4300
-PRYSM_BEACON_MONITORING_PORT=4400
-
-PRYSM_VALIDATOR_RPC_PORT=7000
-PRYSM_VALIDATOR_GRPC_GATEWAY_PORT=7100
-PRYSM_VALIDATOR_MONITORING_PORT=7200
-
+# Load config.env
+source config.env
 
 trap 'echo "Error on line $LINENO"; exit 1' ERR
+
 # Function to handle the cleanup
 cleanup() {
-    echo "Caught Ctrl+C. Killing active background processes and exiting."
-    kill $(jobs -p)  # Kills all background processes started in this script
+    echo "Caught Ctrl+C. Cleaning up..."
+    tmux kill-session -t ethnet 2>/dev/null || true
+    kill $(jobs -p) 2>/dev/null || true
     exit
 }
-# Trap the SIGINT signal and call the cleanup function when it's caught
 trap 'cleanup' SIGINT
 
-# Reset the data from any previous runs and kill any hanging runtimes
-rm -rf "$NETWORK_DIR" || echo "no network directory"
-mkdir -p $NETWORK_DIR
-pkill geth || echo "No existing geth processes"
-pkill beacon-chain || echo "No existing beacon-chain processes"
-pkill validator || echo "No existing validator processes"
-pkill bootnode || echo "No existing bootnode processes"
+echo ""
+echo "🧹  Clean up previous runs"
+echo "────────────────────────────────"
+rm -rf "$NETWORK_DIR"
+mkdir -p "$NETWORK_DIR/setup"
+mkdir -p "$NETWORK_DIR/bootnode"
+mkdir -p "$NETWORK_DIR/settings"
+mkdir -p "$NETWORK_DIR/logs"
+SETTINGS_DIR="$NETWORK_DIR/settings"
+LOGS_DIR="$NETWORK_DIR/logs"
 
-# Set Paths for your binaries. Configure as you wish, particularly
-# if you're developing on a local fork of geth/prysm
-GETH_BINARY=./dependencies/go-ethereum/build/bin/geth
-GETH_BOOTNODE_BINARY=./dependencies/go-ethereum/build/bin/bootnode
+echo "✅ Cleared $NETWORK_DIR"
+echo ""
+if tmux has-session -t "$TMUX_SESSION_NAME" 2>/dev/null; then
+  tmux kill-session -t "$TMUX_SESSION_NAME"
+  echo "✅ tmux session terminated: $TMUX_SESSION_NAME"
+  echo ""
+else
+  echo "✅ No tmux session found"
+  echo ""
+fi
+pkill geth || true
+pkill beacon-chain || true
+pkill validator || true
+pkill bootnode || true
+echo "✅ Killed all running processes"
+echo ""
 
-PRYSM_CTL_BINARY=./dependencies/prysm/bazel-bin/cmd/prysmctl/prysmctl_/prysmctl
-PRYSM_BEACON_BINARY=./dependencies/prysm/bazel-bin/cmd/beacon-chain/beacon-chain_/beacon-chain
-PRYSM_VALIDATOR_BINARY=./dependencies/prysm/bazel-bin/cmd/validator/validator_/validator
 
+echo ""
+echo "🔧  Starting setup"
+echo "────────────────────────────────"
+echo ""
+
+
+echo "✅ Starting bootnode"
+echo ""
 # Create the bootnode for execution client peer discovery. 
 # Not a production grade bootnode. Does not do peer discovery for consensus client
-mkdir -p $NETWORK_DIR/bootnode
-
 $GETH_BOOTNODE_BINARY -genkey $NETWORK_DIR/bootnode/nodekey
 
 $GETH_BOOTNODE_BINARY \
@@ -80,16 +88,17 @@ $GETH_BOOTNODE_BINARY \
     -addr=:$GETH_BOOTNODE_PORT \
     -verbosity=5 > "$NETWORK_DIR/bootnode/bootnode.log" 2>&1 &
 
-sleep 2
+sleep 1
 # Get the ENODE from the first line of the logs for the bootnode
-bootnode_enode=$(head -n 1 $NETWORK_DIR/bootnode/bootnode.log)
-# Check if the line begins with "enode"
-if [[ "$bootnode_enode" == enode* ]]; then
-    echo "bootnode enode is: $bootnode_enode"
-else
-    echo "The bootnode enode was not found. Exiting."
+bootnode_enode=$(grep ^enode "$NETWORK_DIR/bootnode/bootnode.log" || true)
+if [[ "$bootnode_enode" != enode* ]]; then
+    echo "❌ Failed to extract bootnode enode. Exiting."
     exit 1
 fi
+
+# Print only the useful ENODE line
+echo "✅ Bootnode ready: $bootnode_enode"
+echo ""
 
 
 # Generate the genesis. This will generate validators based
@@ -100,8 +109,10 @@ $PRYSM_CTL_BINARY testnet generate-genesis \
 --chain-config-file=./config.yml \
 --geth-genesis-json-in=./genesis.json \
 --output-ssz=$NETWORK_DIR/genesis.ssz \
---geth-genesis-json-out=$NETWORK_DIR/genesis.json
+--geth-genesis-json-out=$NETWORK_DIR/genesis.json > "$NETWORK_DIR/setup/genesis.log" 2>&1
 
+echo "✅ Genesis file generated"
+echo ""
 
 # The prysm bootstrap node is set after the first loop, as the first
 # node is the bootstrap node. This is used for consensus client discovery
@@ -109,102 +120,153 @@ PRYSM_BOOTSTRAP_NODE=
 
 # Calculate how many nodes to wait for to be in sync with. Not a hard rule
 MIN_SYNC_PEERS=$((NUM_NODES/2))
-echo $MIN_SYNC_PEERS is minimum number of synced peers required
 
 # Create the validators in a loop
 for (( i=0; i<$NUM_NODES; i++ )); do
-    NODE_DIR=$NETWORK_DIR/node-$i
-    mkdir -p $NODE_DIR/execution
-    mkdir -p $NODE_DIR/consensus
-    mkdir -p $NODE_DIR/logs
 
+    STORE_LOGS=false
+    if [ $i -lt $NUM_LOGS ]; then
+        STORE_LOGS=true
+        NODE_LOGS_DIR=$LOGS_DIR/node-$i
+        mkdir -p $NODE_LOGS_DIR
+    fi
+
+    # Create the node directories
+    NODE_SETTINGS_DIR=$SETTINGS_DIR/node-$i
+    mkdir -p $NODE_SETTINGS_DIR
+    mkdir -p $NODE_SETTINGS_DIR/execution
+    mkdir -p $NODE_SETTINGS_DIR/consensus
+
+    echo ""
+    echo "🚀 Setting up node-$i"
+    echo "────────────────────────────────"
+    echo ""
     # We use an empty password. Do not do this in production
-    geth_pw_file="$NODE_DIR/geth_password.txt"
+    geth_pw_file="$NODE_SETTINGS_DIR/geth_password.txt"
     echo "" > "$geth_pw_file"
 
-    # Copy the same genesis and inital config the node's directories
+    # Copy the same genesis and initial config the node's directories
     # All nodes must have the same genesis otherwise they will reject eachother
-    cp ./config.yml $NODE_DIR/consensus/config.yml
-    cp $NETWORK_DIR/genesis.ssz $NODE_DIR/consensus/genesis.ssz
-    cp $NETWORK_DIR/genesis.json $NODE_DIR/execution/genesis.json
+    cp ./config.yml $NODE_SETTINGS_DIR/consensus/config.yml
+    cp $NETWORK_DIR/genesis.ssz $NODE_SETTINGS_DIR/consensus/genesis.ssz
+    cp $NETWORK_DIR/genesis.json $NODE_SETTINGS_DIR/execution/genesis.json
 
     # Create the secret keys for this node and other account details
-    $GETH_BINARY account new --datadir "$NODE_DIR/execution" --password "$geth_pw_file"
+    $GETH_BINARY account new --datadir "$NODE_SETTINGS_DIR/execution" --password "$geth_pw_file"
 
-    # Initialize geth for this node. Geth uses the genesis.json to write some initial state
+    echo "✅ Geth account created"
+    echo ""
+
+    # Initialize geth for this node
     $GETH_BINARY init \
-      --datadir=$NODE_DIR/execution \
-      $NODE_DIR/execution/genesis.json
+      --datadir=$NODE_SETTINGS_DIR/execution \
+      $NODE_SETTINGS_DIR/execution/genesis.json
+    
+    echo ""
+    echo "✅ Geth initialized"
+    echo ""
 
     # Start geth execution client for this node
-    $GETH_BINARY \
-      --networkid=${CHAIN_ID:-32382} \
-      --http \
-      --http.api=eth,net,web3 \
-      --http.addr=127.0.0.1 \
-      --http.corsdomain="*" \
-      --http.port=$((GETH_HTTP_PORT + i)) \
-      --port=$((GETH_NETWORK_PORT + i)) \
-      --metrics.port=$((GETH_METRICS_PORT + i)) \
-      --ws \
-      --ws.api=eth,net,web3 \
-      --ws.addr=127.0.0.1 \
-      --ws.origins="*" \
-      --ws.port=$((GETH_WS_PORT + i)) \
-      --authrpc.vhosts="*" \
-      --authrpc.addr=127.0.0.1 \
-      --authrpc.jwtsecret=$NODE_DIR/execution/jwtsecret \
-      --authrpc.port=$((GETH_AUTH_RPC_PORT + i)) \
-      --datadir=$NODE_DIR/execution \
-      --password=$geth_pw_file \
-      --bootnodes=$bootnode_enode \
-      --identity=node-$i \
-      --maxpendpeers=$NUM_NODES \
-      --verbosity=3 \
-      --syncmode=full > "$NODE_DIR/logs/geth.log" 2>&1 &
+    start_geth() {
+      local log_file="$1"
+      $GETH_BINARY \
+        --networkid=${CHAIN_ID:-32382} \
+        --http \
+        --http.api=eth,net,web3 \
+        --http.addr=127.0.0.1 \
+        --http.corsdomain="*" \
+        --http.port=$((GETH_HTTP_PORT + i)) \
+        --port=$((GETH_NETWORK_PORT + i)) \
+        --metrics.port=$((GETH_METRICS_PORT + i)) \
+        --ws \
+        --ws.api=eth,net,web3 \
+        --ws.addr=127.0.0.1 \
+        --ws.origins="*" \
+        --ws.port=$((GETH_WS_PORT + i)) \
+        --authrpc.vhosts="*" \
+        --authrpc.addr=127.0.0.1 \
+        --authrpc.jwtsecret=$NODE_SETTINGS_DIR/execution/jwtsecret \
+        --authrpc.port=$((GETH_AUTH_RPC_PORT + i)) \
+        --datadir=$NODE_SETTINGS_DIR/execution \
+        --password=$geth_pw_file \
+        --bootnodes=$bootnode_enode \
+        --identity=node-$i \
+        --maxpendpeers=$NUM_NODES \
+        --verbosity=3 \
+        --syncmode=full > "$log_file" 2>&1 &
+    }
 
-    sleep 5
+    if [ "$STORE_LOGS" = true ]; then
+      start_geth "$NODE_LOGS_DIR/geth.log"
+    else
+      start_geth "/dev/null"
+    fi
+
+    echo "✅ Geth started"
+    echo ""
 
     # Start prysm consensus client for this node
-    $PRYSM_BEACON_BINARY \
-      --datadir=$NODE_DIR/consensus/beacondata \
-      --min-sync-peers=$MIN_SYNC_PEERS \
-      --genesis-state=$NODE_DIR/consensus/genesis.ssz \
-      --bootstrap-node=$PRYSM_BOOTSTRAP_NODE \
-      --interop-eth1data-votes \
-      --chain-config-file=$NODE_DIR/consensus/config.yml \
-      --contract-deployment-block=0 \
-      --chain-id=${CHAIN_ID:-32382} \
-      --rpc-host=127.0.0.1 \
-      --rpc-port=$((PRYSM_BEACON_RPC_PORT + i)) \
-      --grpc-gateway-host=127.0.0.1 \
-      --grpc-gateway-port=$((PRYSM_BEACON_GRPC_GATEWAY_PORT + i)) \
-      --execution-endpoint=http://localhost:$((GETH_AUTH_RPC_PORT + i)) \
-      --accept-terms-of-use \
-      --jwt-secret=$NODE_DIR/execution/jwtsecret \
-      --suggested-fee-recipient=0x123463a4b065722e99115d6c222f267d9cabb524 \
-      --minimum-peers-per-subnet=0 \
-      --p2p-tcp-port=$((PRYSM_BEACON_P2P_TCP_PORT + i)) \
-      --p2p-udp-port=$((PRYSM_BEACON_P2P_UDP_PORT + i)) \
-      --monitoring-port=$((PRYSM_BEACON_MONITORING_PORT + i)) \
-      --verbosity=info \
-      --slasher \
-      --enable-debug-rpc-endpoints > "$NODE_DIR/logs/beacon.log" 2>&1 &
+    start_beacon() {
+      local log_file="$1"
+      $PRYSM_BEACON_BINARY \
+        --datadir=$NODE_SETTINGS_DIR/consensus/beacondata \
+        --min-sync-peers=$MIN_SYNC_PEERS \
+        --genesis-state=$NODE_SETTINGS_DIR/consensus/genesis.ssz \
+        --bootstrap-node=$PRYSM_BOOTSTRAP_NODE \
+        --interop-eth1data-votes \
+        --chain-config-file=$NODE_SETTINGS_DIR/consensus/config.yml \
+        --contract-deployment-block=0 \
+        --chain-id=${CHAIN_ID:-32382} \
+        --rpc-host=127.0.0.1 \
+        --rpc-port=$((PRYSM_BEACON_RPC_PORT + i)) \
+        --grpc-gateway-host=127.0.0.1 \
+        --grpc-gateway-port=$((PRYSM_BEACON_GRPC_GATEWAY_PORT + i)) \
+        --execution-endpoint=http://localhost:$((GETH_AUTH_RPC_PORT + i)) \
+        --accept-terms-of-use \
+        --jwt-secret=$NODE_SETTINGS_DIR/execution/jwtsecret \
+        --suggested-fee-recipient=0x123463a4b065722e99115d6c222f267d9cabb524 \
+        --minimum-peers-per-subnet=0 \
+        --p2p-tcp-port=$((PRYSM_BEACON_P2P_TCP_PORT + i)) \
+        --p2p-udp-port=$((PRYSM_BEACON_P2P_UDP_PORT + i)) \
+        --monitoring-port=$((PRYSM_BEACON_MONITORING_PORT + i)) \
+        --verbosity=info \
+        --slasher \
+        --enable-debug-rpc-endpoints > "$log_file" 2>&1 &
+    }
 
-    # Start prysm validator for this node. Each validator node will
-    # manage 1 validator
-    $PRYSM_VALIDATOR_BINARY \
-      --beacon-rpc-provider=localhost:$((PRYSM_BEACON_RPC_PORT + i)) \
-      --datadir=$NODE_DIR/consensus/validatordata \
-      --accept-terms-of-use \
-      --interop-num-validators=1 \
-      --interop-start-index=$i \
-      --rpc-port=$((PRYSM_VALIDATOR_RPC_PORT + i)) \
-      --grpc-gateway-port=$((PRYSM_VALIDATOR_GRPC_GATEWAY_PORT + i)) \
-      --monitoring-port=$((PRYSM_VALIDATOR_MONITORING_PORT + i)) \
-      --graffiti="node-$i" \
-      --chain-config-file=$NODE_DIR/consensus/config.yml > "$NODE_DIR/logs/validator.log" 2>&1 &
+    if [ "$STORE_LOGS" = true ]; then
+      start_beacon "$NODE_LOGS_DIR/beacon.log"
+    else
+      start_beacon "/dev/null"
+    fi
 
+    echo "✅ Prysm beacon started"
+    echo ""
+
+    # Start prysm validator for this node
+    start_validator() {
+      local log_file="$1"
+      $PRYSM_VALIDATOR_BINARY \
+        --beacon-rpc-provider=localhost:$((PRYSM_BEACON_RPC_PORT + i)) \
+        --datadir=$NODE_SETTINGS_DIR/consensus/validatordata \
+        --accept-terms-of-use \
+        --interop-num-validators=1 \
+        --interop-start-index=$i \
+        --rpc-port=$((PRYSM_VALIDATOR_RPC_PORT + i)) \
+        --grpc-gateway-port=$((PRYSM_VALIDATOR_GRPC_GATEWAY_PORT + i)) \
+        --monitoring-port=$((PRYSM_VALIDATOR_MONITORING_PORT + i)) \
+        --graffiti="node-$i" \
+        --chain-config-file=$NODE_SETTINGS_DIR/consensus/config.yml > "$log_file" 2>&1 &
+    }
+
+    if [ "$STORE_LOGS" = true ]; then
+      start_validator "$NODE_LOGS_DIR/validator.log"
+    else
+      start_validator "/dev/null"
+    fi
+
+    echo "✅ Prysm validator started"
+    echo ""
 
     # Check if the PRYSM_BOOTSTRAP_NODE variable is already set
     if [[ -z "${PRYSM_BOOTSTRAP_NODE}" ]]; then
@@ -214,14 +276,90 @@ for (( i=0; i<$NUM_NODES; i++ )); do
         PRYSM_BOOTSTRAP_NODE=$(curl -s localhost:4100/eth/v1/node/identity | jq -r '.data.enr')
             # Check if the result starts with enr
         if [[ $PRYSM_BOOTSTRAP_NODE == enr* ]]; then
-            echo "PRYSM_BOOTSTRAP_NODE is valid: $PRYSM_BOOTSTRAP_NODE"
+            echo "✅ Prysm bootstrap ENR: $PRYSM_BOOTSTRAP_NODE"
         else
-            echo "PRYSM_BOOTSTRAP_NODE does NOT start with enr"
+            echo "❌ Failed to obtain bootstrap ENR"
             exit 1
         fi
     fi
 done
 
-# You might want to change this if you want to tail logs for other nodes
-# Logs for all nodes can be found in `./network/node-*/logs`
-tail -f "$NETWORK_DIR/node-0/logs/geth.log"
+
+ip_address=$(hostname -I | awk '{print $1}')
+# print every node's info 
+for (( i=0; i<$NUM_NODES; i++ )); do
+  echo ""
+  echo "🌐 Node-$i connection info"
+  echo "────────────────────────────"
+  echo "• Geth HTTP RPC:       http://$ip_address:$((GETH_HTTP_PORT + i))"
+  echo "• Geth WS:             ws://$ip_address:$((GETH_WS_PORT + i))"
+  echo "• Geth P2P:            $ip_address:$((GETH_NETWORK_PORT + i))"
+  echo "• Prysm GRPC API:      http://$ip_address:$((PRYSM_BEACON_GRPC_GATEWAY_PORT + i))"
+  echo "• Prysm P2P (TCP/UDP): $ip_address:$((PRYSM_BEACON_P2P_TCP_PORT + i)) / $((PRYSM_BEACON_P2P_UDP_PORT + i))"
+  echo ""
+done
+
+bootnode_pubkey=$($GETH_BOOTNODE_BINARY -nodekey $NETWORK_DIR/bootnode/nodekey -writeaddress)
+bootnode_enode_outside="enode://${bootnode_pubkey}@${ip_address}:${GETH_BOOTNODE_PORT}" # 확실하게 이 포트로 바인딩 된게 맞나 모르겠네
+
+echo "🌐 Bootnode info"
+echo "--------------------------------------"
+echo "• Bootnode ENODE:        $bootnode_enode_outside"
+echo "• Beacon ENR:            $PRYSM_BOOTSTRAP_NODE"
+
+
+echo ""
+echo "🖥️  Starting tmux session for log viewing"
+echo "────────────────────────────────"
+echo ""
+
+tmux kill-session -t $TMUX_SESSION_NAME 2>/dev/null || true
+tmux new-session -d -s $TMUX_SESSION_NAME -n "logs"
+
+TOTAL_PANELS=$((NUM_LOGS * 2))
+window_idx=0
+panel_in_window=0
+
+for (( i=0; i<$NUM_LOGS; i++ )); do
+  NODE_LOGS_DIR="$LOGS_DIR/node-$i"
+  GETH_LOG="$NODE_LOGS_DIR/geth.log"
+  BEACON_LOG="$NODE_LOGS_DIR/beacon.log"
+
+  if (( panel_in_window == 4 )); then
+    window_idx=$((window_idx + 1))
+    tmux new-window -t $TMUX_SESSION_NAME:$window_idx -n "logs-$window_idx"
+    panel_in_window=0
+  fi
+
+  if (( panel_in_window == 0 )); then
+    tmux send-keys -t $TMUX_SESSION_NAME:$window_idx "tail -f '$GETH_LOG'" C-m
+    panel_in_window=$((panel_in_window + 1))
+    tmux split-window -v -t $TMUX_SESSION_NAME:$window_idx
+    tmux send-keys -t $TMUX_SESSION_NAME:$window_idx.$panel_in_window "tail -f '$BEACON_LOG'" C-m
+    panel_in_window=$((panel_in_window + 1))
+  else
+    tmux select-layout -t $TMUX_SESSION_NAME:$window_idx tiled
+    tmux split-window -h -t $TMUX_SESSION_NAME:$window_idx
+    tmux send-keys -t $TMUX_SESSION_NAME:$window_idx.$panel_in_window "tail -f '$GETH_LOG'" C-m
+    panel_in_window=$((panel_in_window + 1))
+    tmux split-window -v -t $TMUX_SESSION_NAME:$window_idx
+    tmux send-keys -t $TMUX_SESSION_NAME:$window_idx.$panel_in_window "tail -f '$BEACON_LOG'" C-m
+    panel_in_window=$((panel_in_window + 1))
+  fi
+done
+
+tmux select-layout -t $TMUX_SESSION_NAME:$window_idx tiled
+
+
+echo "🟢 To view logs: tmux attach -t $TMUX_SESSION_NAME"
+echo ""
+echo "📘 tmux quick reference:"
+echo "────────────────────────────"
+echo "• Attach session:     tmux attach -t $TMUX_SESSION_NAME"
+echo "• Detach session:     Ctrl + b, d"
+echo "• Switch window:      Ctrl + b, n (next), Ctrl + b, p (previous)"
+echo "• Move between panes: Ctrl + b + arrow keys (← ↑ ↓ →)"
+echo "• Exit pane:          exit or Ctrl + d"
+echo "• Kill session:       tmux kill-session -t $TMUX_SESSION_NAME"
+echo "────────────────────────────"
+echo ""
