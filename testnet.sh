@@ -85,10 +85,10 @@ $GETH_BOOTNODE_BINARY -genkey $NETWORK_DIR/bootnode/nodekey
 
 $GETH_BOOTNODE_BINARY \
     -nodekey $NETWORK_DIR/bootnode/nodekey \
-    -addr=:$GETH_BOOTNODE_PORT \
+    -addr=0.0.0.0:$GETH_BOOTNODE_PORT \
     -verbosity=5 > "$NETWORK_DIR/bootnode/bootnode.log" 2>&1 &
 
-sleep 1
+sleep 2
 # Get the ENODE from the first line of the logs for the bootnode
 bootnode_enode=$(grep ^enode "$NETWORK_DIR/bootnode/bootnode.log" || true)
 if [[ "$bootnode_enode" != enode* ]]; then
@@ -204,6 +204,7 @@ for (( i=0; i<$NUM_NODES; i++ )); do
 
     echo "✅ Geth started"
     echo ""
+    sleep 2
 
     # Start prysm consensus client for this node
     start_beacon() {
@@ -270,7 +271,7 @@ for (( i=0; i<$NUM_NODES; i++ )); do
 
     # Check if the PRYSM_BOOTSTRAP_NODE variable is already set
     if [[ -z "${PRYSM_BOOTSTRAP_NODE}" ]]; then
-        sleep 5 # sleep to let the prysm node set up
+        sleep 3 # sleep to let the prysm node set up
         # If PRYSM_BOOTSTRAP_NODE is not set, execute the command and capture the result into the variable
         # This allows subsequent nodes to discover the first node, treating it as the bootnode
         PRYSM_BOOTSTRAP_NODE=$(curl -s localhost:4100/eth/v1/node/identity | jq -r '.data.enr')
