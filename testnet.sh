@@ -81,16 +81,39 @@ echo "✅ Starting bootnode"
 echo ""
 # Create the bootnode for execution client peer discovery. 
 # Not a production grade bootnode. Does not do peer discovery for consensus client
-$GETH_BOOTNODE_BINARY -genkey $NETWORK_DIR/bootnode/nodekey
+$GETH_DEVP2P_BINARY key generate $NETWORK_DIR/bootnode/nodekey
+$GETH_DEVP2P_BINARY key to-enr -ip 0.0.0.0 -udp 30303 -tcp 30303 $NETWORK_DIR/bootnode/nodekey
 
-$GETH_BOOTNODE_BINARY \
-    -nodekey $NETWORK_DIR/bootnode/nodekey \
-    -addr=0.0.0.0:$GETH_BOOTNODE_PORT \
-    -verbosity=5 > "$NETWORK_DIR/bootnode/bootnode.log" 2>&1 &
 
-sleep 2
+# $GETH_BINARY \
+#     -nodekey $NETWORK_DIR/bootnode/nodekey \
+#     -addr=0.0.0.0:$GETH_BOOTNODE_PORT \
+#     -verbosity=5 > "$NETWORK_DIR/bootnode/bootnode.log" 2>&1 &
+
+# $GETH_BINARY \
+#   --nodiscover \
+#   --networkid 1234 \
+#   --port $GETH_BOOTNODE_PORT \
+#   --nodekey "$NETWORK_DIR/bootnode/nodekey" \
+#   --verbosity 5 > "$NETWORK_DIR/bootnode/bootnode.log" 2>&1 &
+
+$GETH_BINARY \
+  --networkid=${CHAIN_ID:-7052480736} \
+  --port $GETH_BOOTNODE_PORT \
+  --nodekey "$NETWORK_DIR/bootnode/nodekey" \
+  --verbosity 5 > "$NETWORK_DIR/bootnode/bootnode.log" 2>&1 &
+
+# $GETH_BINARY \
+#   --networkid=${CHAIN_ID:-32382} \
+#   --nodiscover=false \
+#   --maxpeers 0 \
+#   --port $GETH_BOOTNODE_PORT \
+#   --nodekey "$NETWORK_DIR/bootnode/nodekey" \
+#   --verbosity 5 > "$NETWORK_DIR/bootnode/bootnode.log" 2>&1 &
+
+sleep 5
 # Get the ENODE from the first line of the logs for the bootnode
-bootnode_enode=$(grep ^enode "$NETWORK_DIR/bootnode/bootnode.log" || true)
+bootnode_enode=$(grep -o 'enode://[a-zA-Z0-9@.:?=]*' "$NETWORK_DIR/bootnode/bootnode.log" | head -n 1 || true)
 if [[ "$bootnode_enode" != enode* ]]; then
     echo "❌ Failed to extract bootnode enode. Exiting."
     exit 1
@@ -104,7 +127,7 @@ echo ""
 # Generate the genesis. This will generate validators based
 # on https://github.com/ethereum/eth2.0-pm/blob/a085c9870f3956d6228ed2a40cd37f0c6580ecd7/interop/mocked_start/README.md
 $PRYSM_CTL_BINARY testnet generate-genesis \
---fork=deneb \
+--fork=electra \
 --num-validators=$NUM_NODES \
 --chain-config-file=./config.yml \
 --geth-genesis-json-in=./genesis.json \
@@ -170,16 +193,16 @@ for (( i=0; i<$NUM_NODES; i++ )); do
     start_geth() {
       local log_file="$1"
       $GETH_BINARY \
-        --networkid=${CHAIN_ID:-32382} \
+        --networkid=${CHAIN_ID:-7052480736} \
         --http \
-        --http.api=eth,net,web3 \
+        --http.api=eth,engine,admin,net,web3 \
         --http.addr=127.0.0.1 \
         --http.corsdomain="*" \
         --http.port=$((GETH_HTTP_PORT + i)) \
         --port=$((GETH_NETWORK_PORT + i)) \
         --metrics.port=$((GETH_METRICS_PORT + i)) \
         --ws \
-        --ws.api=eth,net,web3 \
+        --ws.api=eth,net,web3,subscribe \
         --ws.addr=127.0.0.1 \
         --ws.origins="*" \
         --ws.port=$((GETH_WS_PORT + i)) \
@@ -204,25 +227,24 @@ for (( i=0; i<$NUM_NODES; i++ )); do
 
     echo "✅ Geth started"
     echo ""
-    sleep 2
+    sleep 5
 
     # Start prysm consensus client for this node
     start_beacon() {
       local log_file="$1"
       $PRYSM_BEACON_BINARY \
         --datadir=$NODE_SETTINGS_DIR/consensus/beacondata \
-        --min-sync-peers=$MIN_SYNC_PEERS \
+        --min-sync-peers=0 \
         --genesis-state=$NODE_SETTINGS_DIR/consensus/genesis.ssz \
         --bootstrap-node=$PRYSM_BOOTSTRAP_NODE \
-        --interop-eth1data-votes \
         --chain-config-file=$NODE_SETTINGS_DIR/consensus/config.yml \
         --contract-deployment-block=0 \
-        --chain-id=${CHAIN_ID:-32382} \
+        --chain-id=${CHAIN_ID:-7052480736} \
         --rpc-host=127.0.0.1 \
         --rpc-port=$((PRYSM_BEACON_RPC_PORT + i)) \
         --grpc-gateway-host=127.0.0.1 \
         --grpc-gateway-port=$((PRYSM_BEACON_GRPC_GATEWAY_PORT + i)) \
-        --execution-endpoint=http://localhost:$((GETH_AUTH_RPC_PORT + i)) \
+        --execution-endpoint=http://127.0.0.1:$((GETH_AUTH_RPC_PORT + i)) \
         --accept-terms-of-use \
         --jwt-secret=$NODE_SETTINGS_DIR/execution/jwtsecret \
         --suggested-fee-recipient=0x123463a4b065722e99115d6c222f267d9cabb524 \
@@ -230,7 +252,7 @@ for (( i=0; i<$NUM_NODES; i++ )); do
         --p2p-tcp-port=$((PRYSM_BEACON_P2P_TCP_PORT + i)) \
         --p2p-udp-port=$((PRYSM_BEACON_P2P_UDP_PORT + i)) \
         --monitoring-port=$((PRYSM_BEACON_MONITORING_PORT + i)) \
-        --verbosity=info \
+        --verbosity=debug \
         --slasher \
         --enable-debug-rpc-endpoints > "$log_file" 2>&1 &
     }
@@ -271,7 +293,7 @@ for (( i=0; i<$NUM_NODES; i++ )); do
 
     # Check if the PRYSM_BOOTSTRAP_NODE variable is already set
     if [[ -z "${PRYSM_BOOTSTRAP_NODE}" ]]; then
-        sleep 3 # sleep to let the prysm node set up
+        sleep 5 # sleep to let the prysm node set up
         # If PRYSM_BOOTSTRAP_NODE is not set, execute the command and capture the result into the variable
         # This allows subsequent nodes to discover the first node, treating it as the bootnode
         PRYSM_BOOTSTRAP_NODE=$(curl -s localhost:4100/eth/v1/node/identity | jq -r '.data.enr')
@@ -286,7 +308,10 @@ for (( i=0; i<$NUM_NODES; i++ )); do
 done
 
 
-ip_address=$(hostname -I | awk '{print $1}')
+# ip_address=$(hostname -I | awk '{print $1}') # linux
+ip_address=$(ifconfig | awk '/inet / && $2 != "127.0.0.1" { print $2; exit }') # mac
+echo "Local IP address: $ip_address"
+
 # print every node's info 
 for (( i=0; i<$NUM_NODES; i++ )); do
   echo ""
@@ -300,15 +325,16 @@ for (( i=0; i<$NUM_NODES; i++ )); do
   echo ""
 done
 
-bootnode_pubkey=$($GETH_BOOTNODE_BINARY -nodekey $NETWORK_DIR/bootnode/nodekey -writeaddress)
-bootnode_enode_outside="enode://${bootnode_pubkey}@${ip_address}:${GETH_BOOTNODE_PORT}" # 확실하게 이 포트로 바인딩 된게 맞나 모르겠네
+# bootnode_pubkey=$($GETH_DEVP2P_BINARY nodekey $NETWORK_DIR/bootnode/nodekey -writeaddress)
+# bootnode_enode_outside="enode://${bootnode_pubkey}@${ip_address}:${GETH_BOOTNODE_PORT}" # 확실하게 이 포트로 바인딩 된게 맞나 모르겠네
 
-echo "🌐 Bootnode info"
-echo "--------------------------------------"
-echo "• Bootnode ENODE:        $bootnode_enode_outside"
-echo "• Beacon ENR:            $PRYSM_BOOTSTRAP_NODE"
+# echo "🌐 Bootnode info"
+# echo "--------------------------------------"
+# echo "• Bootnode ENODE:        $bootnode_enode_outside"
+# echo "• Beacon ENR:            $PRYSM_BOOTSTRAP_NODE"
 
 
+sleep 2
 echo ""
 echo "🖥️  Starting tmux session for log viewing"
 echo "────────────────────────────────"
