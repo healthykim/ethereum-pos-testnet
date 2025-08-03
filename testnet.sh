@@ -76,54 +76,6 @@ echo "🔧  Starting setup"
 echo "────────────────────────────────"
 echo ""
 
-
-echo "✅ Starting bootnode"
-echo ""
-# Create the bootnode for execution client peer discovery. 
-# Not a production grade bootnode. Does not do peer discovery for consensus client
-$GETH_DEVP2P_BINARY key generate $NETWORK_DIR/bootnode/nodekey
-$GETH_DEVP2P_BINARY key to-enr -ip 0.0.0.0 -udp 30303 -tcp 30303 $NETWORK_DIR/bootnode/nodekey
-
-
-# $GETH_BINARY \
-#     -nodekey $NETWORK_DIR/bootnode/nodekey \
-#     -addr=0.0.0.0:$GETH_BOOTNODE_PORT \
-#     -verbosity=5 > "$NETWORK_DIR/bootnode/bootnode.log" 2>&1 &
-
-# $GETH_BINARY \
-#   --nodiscover \
-#   --networkid 1234 \
-#   --port $GETH_BOOTNODE_PORT \
-#   --nodekey "$NETWORK_DIR/bootnode/nodekey" \
-#   --verbosity 5 > "$NETWORK_DIR/bootnode/bootnode.log" 2>&1 &
-
-$GETH_BINARY \
-  --networkid=${CHAIN_ID:-7052480736} \
-  --port $GETH_BOOTNODE_PORT \
-  --nodekey "$NETWORK_DIR/bootnode/nodekey" \
-  --verbosity 5 > "$NETWORK_DIR/bootnode/bootnode.log" 2>&1 &
-
-# $GETH_BINARY \
-#   --networkid=${CHAIN_ID:-32382} \
-#   --nodiscover=false \
-#   --maxpeers 0 \
-#   --port $GETH_BOOTNODE_PORT \
-#   --nodekey "$NETWORK_DIR/bootnode/nodekey" \
-#   --verbosity 5 > "$NETWORK_DIR/bootnode/bootnode.log" 2>&1 &
-
-sleep 5
-# Get the ENODE from the first line of the logs for the bootnode
-bootnode_enode=$(grep -o 'enode://[a-zA-Z0-9@.:?=]*' "$NETWORK_DIR/bootnode/bootnode.log" | head -n 1 || true)
-if [[ "$bootnode_enode" != enode* ]]; then
-    echo "❌ Failed to extract bootnode enode. Exiting."
-    exit 1
-fi
-
-# Print only the useful ENODE line
-echo "✅ Bootnode ready: $bootnode_enode"
-echo ""
-
-
 # Generate the genesis. This will generate validators based
 # on https://github.com/ethereum/eth2.0-pm/blob/a085c9870f3956d6228ed2a40cd37f0c6580ecd7/interop/mocked_start/README.md
 $PRYSM_CTL_BINARY testnet generate-genesis \
@@ -144,6 +96,7 @@ PRYSM_BOOTSTRAP_NODE=
 # Calculate how many nodes to wait for to be in sync with. Not a hard rule
 MIN_SYNC_PEERS=$((NUM_NODES/2))
 
+declare -a enodes
 # Create the validators in a loop
 for (( i=0; i<$NUM_NODES; i++ )); do
 
@@ -212,12 +165,13 @@ for (( i=0; i<$NUM_NODES; i++ )); do
         --authrpc.port=$((GETH_AUTH_RPC_PORT + i)) \
         --datadir=$NODE_SETTINGS_DIR/execution \
         --password=$geth_pw_file \
-        --bootnodes=$bootnode_enode \
+        --nodiscover \
         --identity=node-$i \
         --maxpendpeers=$NUM_NODES \
-        --verbosity=3 \
+        --verbosity=4 \
         --syncmode=full > "$log_file" 2>&1 &
     }
+
 
     if [ "$STORE_LOGS" = true ]; then
       start_geth "$NODE_LOGS_DIR/geth.log"
@@ -228,6 +182,13 @@ for (( i=0; i<$NUM_NODES; i++ )); do
     echo "✅ Geth started"
     echo ""
     sleep 5
+
+    response=$(curl -s -X POST http://127.0.0.1:$((GETH_HTTP_PORT + i)) \
+      -H "Content-Type: application/json" \
+      --data '{"jsonrpc":"2.0","method":"admin_nodeInfo","params":[],"id":1}' \
+      | jq -r .result.enode)
+
+    enodes[$i]=$response
 
     # Start prysm consensus client for this node
     start_beacon() {
@@ -307,6 +268,23 @@ for (( i=0; i<$NUM_NODES; i++ )); do
     fi
 done
 
+echo $enodes
+
+for i in $(seq 0 $((NUM_NODES - 1))); do
+  from_port=$((GETH_HTTP_PORT + i))
+  echo "🔗 node $i (port $from_port) →"
+
+  for j in $(seq 0 $((NUM_NODES - 1))); do
+    if [[ $i -ne $j ]]; then
+      enode="${enodes[$j]}"
+      curl -s -X POST http://127.0.0.1:$from_port \
+        -H "Content-Type: application/json" \
+        --data "{\"jsonrpc\":\"2.0\",\"method\":\"admin_addPeer\",\"params\":[\"$enode\"],\"id\":1}" \
+        > /dev/null
+      echo "   ➤ addPeer(${j})"
+    fi
+  done
+done
 
 # ip_address=$(hostname -I | awk '{print $1}') # linux
 ip_address=$(ifconfig | awk '/inet / && $2 != "127.0.0.1" { print $2; exit }') # mac
